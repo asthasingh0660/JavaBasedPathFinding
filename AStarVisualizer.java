@@ -1,33 +1,48 @@
 /*
-A* Algorithm Visualizer - Single-file Java Swing application
+A* Algorithm Visualizer - Java Swing (Enhanced)
 
-How to use:
-1. Save this file as AStarVisualizer.java
+What's new in this version:
+- Proper non-blocking visualization using SwingWorker (so UI stays responsive)
+- Exploration animation: cells being considered are shown in a yellow gradient
+- Final path animation: after A* finds the goal, the path is animated in blue
+- Maze generator (Recursive backtracker) accessible via "Generate Maze" button
+- Buttons preserved: Run A*, Clear Path, Reset, Random Walls; added Generate Maze
+- Keeps same single-file usage: save as AStarVisualizer.java, compile & run
+
+How to use (same as before):
+1. Save as AStarVisualizer.java
 2. Compile: javac AStarVisualizer.java
 3. Run: java AStarVisualizer
 
 Controls:
-- Left-click on grid: toggle wall
-- Right-click on grid: set Start (first right-click) and Goal (second right-click). Right-click again to move Start/Goal.
-- SHIFT + Left-click: paint walls continuously while dragging
-- Buttons:
-  * Run A*: starts visualization
-  * Clear Path: clears only the path/visited states (keeps walls/start/goal)
-  * Reset: clears everything
-  * Random Walls: fill grid with random obstacles
+- Left-click: toggle wall
+- Right-click: set Start (first) and Goal (second), subsequent right-clicks move nearest of them
+- SHIFT+drag with left-button: paint walls
+- Generate Maze: create a perfect maze
+- Run A*: visualizes exploration (yellow) and final path (blue)
 
-This is intentionally a compact, single-file visualizer suitable for learning and extension.
+This file is intentionally compact but structured so you can extend it further (weights, step-by-step mode, export GIF).
 */
 
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.Random;
+import java.util.Arrays;
+import java.util.Objects;
 
 public class AStarVisualizer extends JFrame {
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
-            AStarVisualizer v = new AStarVisualizer(30, 30, 20); // rows, cols, cellSize
+            AStarVisualizer v = new AStarVisualizer(31, 41, 20); // rows, cols, cellSize (odd dims are good for mazes)
             v.setVisible(true);
         });
     }
@@ -35,7 +50,7 @@ public class AStarVisualizer extends JFrame {
     private GridPanel gridPanel;
 
     public AStarVisualizer(int rows, int cols, int cellSize) {
-        super("A* Algorithm Visualizer - Java Swing");
+        super("A* Algorithm Visualizer - Java Swing (Enhanced)");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         gridPanel = new GridPanel(rows, cols, cellSize);
 
@@ -44,6 +59,7 @@ public class AStarVisualizer extends JFrame {
         JButton clearPathBtn = new JButton("Clear Path");
         JButton resetBtn = new JButton("Reset");
         JButton randomBtn = new JButton("Random Walls");
+        JButton mazeBtn = new JButton("Generate Maze");
         JSlider speed = new JSlider(0, 200, 40);
         speed.setToolTipText("Visualization delay (ms)");
 
@@ -51,11 +67,13 @@ public class AStarVisualizer extends JFrame {
         clearPathBtn.addActionListener(e -> gridPanel.clearPath());
         resetBtn.addActionListener(e -> gridPanel.resetAll());
         randomBtn.addActionListener(e -> gridPanel.randomWalls(0.3));
+        mazeBtn.addActionListener(e -> gridPanel.generateMaze());
 
         control.add(runBtn);
         control.add(clearPathBtn);
         control.add(resetBtn);
         control.add(randomBtn);
+        control.add(mazeBtn);
         control.add(new JLabel("Delay"));
         control.add(speed);
 
@@ -72,6 +90,7 @@ public class AStarVisualizer extends JFrame {
             int r, c;
             double g, f; // g = cost from start, f = g + h
             Node parent;
+            int visitOrder = -1; // for gradient
             Node(int r, int c) { this.r = r; this.c = c; g = Double.POSITIVE_INFINITY; f = Double.POSITIVE_INFINITY; }
             public int compareTo(Node o) { return Double.compare(this.f, o.f); }
             public boolean equals(Object o) {
@@ -87,11 +106,12 @@ public class AStarVisualizer extends JFrame {
         private Node startNode = null, goalNode = null;
 
         // Visualization sets
-        private Set<Node> closedSet = new HashSet<>();
-        private Set<Node> openSet = new HashSet<>();
-        private java.util.List<Node> finalPath = new ArrayList<>();
+        private Set<Node> closedSet = Collections.synchronizedSet(new HashSet<>());
+        private Set<Node> openSet = Collections.synchronizedSet(new HashSet<>());
+        private List<Node> finalPath = Collections.synchronizedList(new ArrayList<>());
 
-        private boolean painting = false;
+        private volatile boolean painting = false;
+        private volatile int visitCounter = 0;
 
         public GridPanel(int rows, int cols, int cellSize) {
             this.rows = rows; this.cols = cols; this.cellSize = cellSize;
@@ -100,13 +120,11 @@ public class AStarVisualizer extends JFrame {
             setBackground(Color.WHITE);
 
             MouseAdapter ma = new MouseAdapter() {
-                private boolean dragging = false;
                 public void mousePressed(MouseEvent e) {
                     int r = e.getY()/cellSize;
                     int c = e.getX()/cellSize;
                     if (!inBounds(r, c)) return;
                     if (SwingUtilities.isRightMouseButton(e)) {
-                        // set start/goal
                         if (startNode == null) {
                             setCell(r, c, CellType.START);
                             startNode = nodes[r][c];
@@ -114,7 +132,6 @@ public class AStarVisualizer extends JFrame {
                             setCell(r, c, CellType.GOAL);
                             goalNode = nodes[r][c];
                         } else {
-                            // move start or goal depending on proximity
                             double dToStart = Math.hypot(r - startNode.r, c - startNode.c);
                             double dToGoal  = Math.hypot(r - goalNode.r,  c - goalNode.c);
                             if (dToStart < dToGoal) {
@@ -131,7 +148,7 @@ public class AStarVisualizer extends JFrame {
                         repaint();
                     } else if (SwingUtilities.isLeftMouseButton(e)) {
                         if (e.isShiftDown()) {
-                            painting = true; dragging = true;
+                            painting = true;
                             toggleWall(r, c, true);
                         } else {
                             toggleWall(r, c, false);
@@ -140,9 +157,7 @@ public class AStarVisualizer extends JFrame {
                         repaint();
                     }
                 }
-                public void mouseReleased(MouseEvent e) {
-                    painting = false; dragging = false;
-                }
+                public void mouseReleased(MouseEvent e) { painting = false; }
                 public void mouseDragged(MouseEvent e) {
                     if (!painting) return;
                     int r = e.getY()/cellSize;
@@ -189,7 +204,6 @@ public class AStarVisualizer extends JFrame {
             for (int r=0;r<rows;r++) for (int c=0;c<cols;c++) {
                 grid[r][c] = (rnd.nextDouble() < density) ? CellType.WALL : CellType.EMPTY;
             }
-            // don't overwrite start/goal
             if (startNode!=null) grid[startNode.r][startNode.c] = CellType.START;
             if (goalNode!=null) grid[goalNode.r][goalNode.c] = CellType.GOAL;
             clearSearchState();
@@ -202,6 +216,7 @@ public class AStarVisualizer extends JFrame {
         }
         private void clearSearchState() {
             closedSet.clear(); openSet.clear(); finalPath.clear();
+            visitCounter = 0;
             initNodes();
         }
 
@@ -218,10 +233,10 @@ public class AStarVisualizer extends JFrame {
         }
 
         private double heuristic(Node a, Node b) {
-            // Use Manhattan distance
             return Math.abs(a.r - b.r) + Math.abs(a.c - b.c);
         }
 
+        // Run A* in a background SwingWorker and publish visited nodes so paintComponent can animate them
         public void runAStar(int delayMs) {
             clearSearchState();
             if (startNode==null || goalNode==null) {
@@ -229,48 +244,61 @@ public class AStarVisualizer extends JFrame {
                 return;
             }
 
-            // Prepare
-            PriorityQueue<Node> openPQ = new PriorityQueue<>();
-            startNode.g = 0; startNode.f = heuristic(startNode, goalNode);
-            openPQ.add(startNode);
-            openSet.add(startNode);
+            SwingWorker<Void, Node> worker = new SwingWorker<>() {
+                @Override
+                protected Void doInBackground() {
+                    PriorityQueue<Node> openPQ = new PriorityQueue<>();
+                    startNode.g = 0; startNode.f = heuristic(startNode, goalNode);
+                    openPQ.add(startNode);
+                    openSet.add(startNode);
 
-            boolean found = false;
+                    boolean found = false;
 
-            while (!openPQ.isEmpty()) {
-                Node current = openPQ.poll();
-                openSet.remove(current);
-                closedSet.add(current);
+                    while (!openPQ.isEmpty()) {
+                        Node current = openPQ.poll();
+                        openSet.remove(current);
+                        if (closedSet.contains(current)) continue; // may have duplicates
+                        closedSet.add(current);
 
-                if (current.equals(goalNode)) { found = true; reconstructPath(current); break; }
+                        // mark visit order for gradient
+                        current.visitOrder = visitCounter++;
+                        publish(current); // will cause process() to run on EDT
 
-                for (Node nbr : neighbors(current)) {
-                    if (closedSet.contains(nbr)) continue;
-                    double tentative_g = current.g + 1; // uniform cost
-                    boolean better = false;
-                    if (!openSet.contains(nbr)) {
-                        openSet.add(nbr);
-                        better = true;
-                    } else if (tentative_g < nbr.g) {
-                        better = true;
+                        if (current.equals(goalNode)) { found = true; reconstructPath(current); break; }
+
+                        for (Node nbr : neighbors(current)) {
+                            if (closedSet.contains(nbr)) continue;
+                            double tentative_g = current.g + 1;
+                            boolean better = false;
+                            if (!openSet.contains(nbr)) {
+                                openSet.add(nbr);
+                                better = true;
+                            } else if (tentative_g < nbr.g) {
+                                better = true;
+                            }
+                            if (better) {
+                                nbr.parent = current;
+                                nbr.g = tentative_g;
+                                nbr.f = nbr.g + heuristic(nbr, goalNode);
+                                openPQ.remove(nbr);
+                                openPQ.add(nbr);
+                            }
+                        }
+
+                        try { Thread.sleep(Math.max(0, delayMs)); } catch (InterruptedException ignored) {}
                     }
-                    if (better) {
-                        nbr.parent = current;
-                        nbr.g = tentative_g;
-                        nbr.f = nbr.g + heuristic(nbr, goalNode);
-                        // update PQ: remove and re-add (no decrease-key)
-                        openPQ.remove(nbr);
-                        openPQ.add(nbr);
-                    }
+
+                    if (!found) SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(GridPanel.this, "No path found.", "Result", JOptionPane.INFORMATION_MESSAGE));
+                    return null;
                 }
 
-                repaint();
-                sleep(delayMs);
-            }
-
-            if (!found) {
-                JOptionPane.showMessageDialog(this, "No path found.", "Result", JOptionPane.INFORMATION_MESSAGE);
-            }
+                @Override
+                protected void process(List<Node> chunks) {
+                    // chunks are published visited nodes; repaint to show gradient
+                    repaint();
+                }
+            };
+            worker.execute();
         }
 
         private void reconstructPath(Node end) {
@@ -280,21 +308,65 @@ public class AStarVisualizer extends JFrame {
                 finalPath.add(cur);
                 cur = cur.parent;
             }
-            // mark path cells
-            for (Node p : finalPath) {
-                if (!p.equals(goalNode)) grid[p.r][p.c] = CellType.PATH;
-            }
+            // animate path on EDT
+            SwingUtilities.invokeLater(() -> animatePath());
+        }
+
+        private void animatePath() {
+            // Show path cells one by one in blue
+            Timer t = new Timer(50, null);
+            final int[] idx = {finalPath.size()-1}; // start from start->goal order
+            t.addActionListener(e -> {
+                if (idx[0] < 0) { ((Timer)e.getSource()).stop(); return; }
+                Node p = finalPath.get(idx[0]);
+                if (!p.equals(goalNode) && !p.equals(startNode)) grid[p.r][p.c] = CellType.PATH;
+                idx[0]--;
+                repaint();
+            });
+            t.start();
+        }
+
+        // Maze generator (recursive backtracker). Leaves start/goal untouched if present.
+        public void generateMaze() {
+            // Make everything a wall
+            for (int r=0;r<rows;r++) for (int c=0;c<cols;c++) grid[r][c] = CellType.WALL;
+            // Start from a random odd cell
+            Random rnd = new Random();
+            int sr = rnd.nextInt(rows/2)*2+1; // odd
+            int sc = rnd.nextInt(cols/2)*2+1; // odd
+            carve(sr, sc, rnd);
+            if (startNode!=null) grid[startNode.r][startNode.c] = CellType.START;
+            if (goalNode!=null) grid[goalNode.r][goalNode.c] = CellType.GOAL;
+            clearSearchState();
             repaint();
         }
 
-        private void sleep(int ms) {
-            try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+        private void carve(int r, int c, Random rnd) {
+            grid[r][c] = CellType.EMPTY;
+            Integer[] dirs = {0,1,2,3};
+            List<Integer> order = Arrays.asList(dirs);
+            Collections.shuffle(order, rnd);
+            for (int d : order) {
+                int dr = 0, dc = 0;
+                if (d==0) { dr = -2; dc = 0; }
+                if (d==1) { dr = 2; dc = 0; }
+                if (d==2) { dr = 0; dc = -2; }
+                if (d==3) { dr = 0; dc = 2; }
+                int nr = r + dr, nc = c + dc;
+                if (nr <= 0 || nr >= rows-1 || nc <= 0 || nc >= cols-1) continue;
+                if (grid[nr][nc] == CellType.WALL) {
+                    // knock down between
+                    grid[r + dr/2][c + dc/2] = CellType.EMPTY;
+                    carve(nr, nc, rnd);
+                }
+            }
         }
 
         @Override
         protected void paintComponent(Graphics g) {
             super.paintComponent(g);
             Graphics2D g2 = (Graphics2D) g;
+            int maxVisit = Math.max(1, visitCounter);
             for (int r=0;r<rows;r++) {
                 for (int c=0;c<cols;c++) {
                     int x = c*cellSize, y = r*cellSize;
@@ -302,23 +374,37 @@ public class AStarVisualizer extends JFrame {
                     switch (t) {
                         case EMPTY: g2.setColor(Color.WHITE); break;
                         case WALL: g2.setColor(Color.DARK_GRAY); break;
-                        case START: g2.setColor(Color.GREEN); break;
-                        case GOAL: g2.setColor(Color.RED); break;
-                        case PATH: g2.setColor(Color.CYAN); break;
+                        case START: g2.setColor(new Color(34,139,34)); break; // darker green
+                        case GOAL: g2.setColor(new Color(178,34,34)); break; // darker red
+                        case PATH: g2.setColor(new Color(30,144,255)); break; // DodgerBlue for final path
+                        default: g2.setColor(Color.WHITE); break;
                     }
                     g2.fillRect(x, y, cellSize, cellSize);
-                    // draw open/closed overlay
+
+                    // draw exploration overlay: if node has visitOrder, paint yellow-ish with gradient depending on order
                     Node n = nodes[r][c];
-                    if (closedSet.contains(n) && t==CellType.EMPTY) {
-                        g2.setColor(new Color(255,200,200)); g2.fillRect(x, y, cellSize, cellSize);
-                    } else if (openSet.contains(n) && t==CellType.EMPTY) {
-                        g2.setColor(new Color(200,255,200)); g2.fillRect(x, y, cellSize, cellSize);
+                    if (n.visitOrder >= 0 && grid[r][c]==CellType.EMPTY) {
+                        float frac = (float)n.visitOrder / (float)maxVisit;
+                        // earlier visits are brighter
+                        int alpha = 80 + (int)((1.0 - frac) * 120); // 80..200
+                        g2.setColor(new Color(255, 215, 0, Math.max(0, Math.min(255, alpha)))); // gold/yellow
+                        g2.fillRect(x, y, cellSize, cellSize);
                     }
+
+                    // open/closed tint for empties
+                    if (closedSet.contains(n) && grid[r][c]==CellType.EMPTY) {
+                        // subtle red tint already covered by visit overlay; optional extra border
+                        g2.setColor(new Color(180,80,80,60)); g2.fillRect(x, y, cellSize, cellSize);
+                    } else if (openSet.contains(n) && grid[r][c]==CellType.EMPTY) {
+                        g2.setColor(new Color(80,180,80,50)); g2.fillRect(x, y, cellSize, cellSize);
+                    }
+
                     g2.setColor(Color.LIGHT_GRAY);
                     g2.drawRect(x, y, cellSize, cellSize);
                 }
             }
-            // draw f/g values if small grid
+
+            // small grid: draw f values
             if (rows*cols <= 900) {
                 g2.setColor(Color.BLACK);
                 for (int r=0;r<rows;r++) for (int c=0;c<cols;c++) {
@@ -333,5 +419,3 @@ public class AStarVisualizer extends JFrame {
         }
     }
 }
-
-
